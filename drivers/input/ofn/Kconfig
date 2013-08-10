@@ -1,0 +1,8 @@
+#
+# OFN configuration
+#
+config AVAGO_OFN
+	tristate "Avago OFN driver"
+	---help---
+	This driver support SPI bus AVAGO OFN driver
+

@@ -1,0 +1,1160 @@
+/* drivers/input/touchscreen/avago_ofn.c
+ *
+ * Copyright (C) 2010 Avago Technologies. 
+ *
+ * This software is licensed under the terms of the GNU General Public
+ * License version 2, as published by the Free Software Foundation, and
+ * may be copied, distributed, and modified under those terms.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ */
+
+#include <linux/module.h>
+#include <linux/input.h>
+#include <linux/interrupt.h>
+#include <linux/spi/spi.h>
+#include <linux/earlysuspend.h>
+#include <linux/hrtimer.h>
+#include <linux/platform_device.h>
+//#include <linux/i2c.h>
+#include <linux/delay.h>
+#include "avago_ofn.h"
+#include <linux/io.h>
+#include <linux/gpio.h>
+#include <mach/gpio.h>
+
+
+
+
+/* AVAGO_RESET will driver NRST pin low then high to reset the chip */
+//#define AVAGO_RESET
+#define AVAGO_GPIO_CONTROL_SHUTDOWN
+#define AVAGO_DOME
+//#define AVAGO_FPD
+#define AVAGO_LED_CONTROL
+
+#define FPD_POLL_TIME	70 // 70ms
+
+#define THIRTEEN_MA		0
+#define FORTY_MA			1
+#define FINGER_ON_THRESHOLD		12
+
+#define I2C_M_WR				0
+#define leswap(x) ( ((x << 8) & 0xff00) | ((x >> 8) & 0xff) )
+#define MS_TO_NS(x) (x *1E6L)
+
+
+// ADBM_A320 Register Addresses
+#define ADBM_A320_PRODUCTID_ADDR         0x83
+#define ADBM_A320_REVISIONID_ADDR        0x01     //0x00
+#define ADBM_A320_MOTION_ADDR            0x02
+#define ADBM_A320_DELTAX_ADDR            0x03
+#define ADBM_A320_DELTAY_ADDR            0x04
+#define ADBM_A320_SQUAL_ADDR             0x05
+#define ADBM_A320_SHUTTERUPPER_ADDR      0x06
+#define ADBM_A320_SHUTTERLOWER_ADDR      0x07
+#define ADBM_A320_MAXIMUMPIXEL_ADDR      0x08
+#define ADBM_A320_PIXELSUM_ADDR          0x09
+#define ADBM_A320_MINIMUMPIXEL_ADDR      0x0A
+#define ADBM_A320_PIXELGRAB_ADDR         0x0B
+#define ADBM_A320_CRC0_ADDR              0x0C
+#define ADBM_A320_CRC1_ADDR              0x0D
+#define ADBM_A320_CRC2_ADDR              0x0E
+#define ADBM_A320_CRC3_ADDR              0x0F
+#define ADBM_A320_SELFTEST_ADDR          0x10
+#define ADBM_A320_CONFIGURATIONBITS_ADDR 0x11
+#define ADBM_A320_LED_CONTROL_ADDR       0x1A
+#define ADBM_A320_IO_MODE_ADDR           0x1C
+#define ADBM_A320_OBSERVATION_ADDR       0x2E
+#define ADBM_A320_SOFTRESET_ADDR      	 0x3A     //0x5A
+#define ADBM_A320_SHUTTER_MAX_HI_ADDR    0x3B
+#define ADBM_A320_SHUTTER_MAX_LO_ADDR    0x3C
+#define ADBM_A320_INVERSEREVISIONID_ADDR 0x3E     //0xFF
+#define ADBM_A320_INVERSEPRODUCTID_ADDR  0x3F     //0x7C
+typedef union
+{
+	uint16_t w;
+	uint8_t b[2];
+}
+union16;
+
+static struct workqueue_struct *avago_ofn_wq;
+
+struct avago_ofn_platform_data {
+	uint32_t version;
+	int (*power)(int on);
+};
+
+struct avago_fpd_data {
+	uint8_t motion2;
+	uint8_t finger_on_counter;
+	uint8_t finger_leave_counter;
+	uint8_t FPD_turned_off;
+	uint8_t shutter_values_captured;
+	uint8_t last_state;
+	uint16_t shutter_at_40ma;
+	uint16_t shutter_at_13ma;
+	uint8_t switch_led_counter;
+};
+	
+struct avago_ofn_data {
+	struct spi_device *spi;
+	struct input_dev *input_dev;
+	int use_irq;
+	uint8_t irq;
+	struct hrtimer timer;
+	struct hrtimer dome_timer;
+	struct work_struct  work;
+	int shutdown_gpio;
+	int dome_gpio;
+	int led_up_gpio;
+	int led_down_gpio;
+	uint16_t dome_count;
+	int motion_x;
+	int motion_y;
+	int motion_count;
+	int key_pressed;
+
+	uint8_t fpd_support;
+	struct avago_fpd_data fpd;
+
+	//uint8_t test_mode;
+	
+	int (*power)(int on);
+	struct early_suspend early_suspend;
+};
+
+/* define a globle for easy porting */
+static int test_mode = 0;
+
+static unsigned char avago_keycode[8] = {
+	KEY_UP,
+	KEY_DOWN,
+	KEY_LEFT,
+	KEY_RIGHT,
+	KEY_HOME,
+	KEY_MENU,
+	KEY_A,
+	KEY_B
+};	
+
+#ifdef CONFIG_HAS_EARLYSUSPEND
+static void avago_ofn_early_suspend(struct early_suspend *h);
+static void avago_ofn_late_resume(struct early_suspend *h);
+#endif
+
+
+static ssize_t ofn_mode_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	ssize_t ret = 0;
+
+	if(test_mode)
+		sprintf(buf, "Current mode is test mode.\n");
+	else
+		sprintf(buf, "Current mode is normal mode.\n");
+		
+	ret = strlen(buf) + 1;
+
+	return ret;
+}
+
+static ssize_t ofn_mode_store(struct device *dev, struct device_attribute *attr,
+		const char *buf, size_t count)
+{
+	char data[128];
+	sscanf(buf, "%s", data);
+	if(strcmp(data, "test") == 0)
+	{
+		test_mode = 1;
+		printk(KERN_ERR "enter test mode\n");
+	}
+	if(strcmp(data, "normal") == 0)
+	{
+		test_mode = 0;
+		printk(KERN_ERR "enter normal mode\n");
+	}
+
+	return count;
+}
+
+static DEVICE_ATTR(mode, S_IRUSR | S_IRGRP | S_IROTH, ofn_mode_show, ofn_mode_store);
+static struct kobject *android_ofn_kobj;
+
+static int ofn_sysfs_init(void)
+{
+	int ret;
+	android_ofn_kobj = kobject_create_and_add("ofn", NULL);
+	if (android_ofn_kobj == NULL) {
+		printk(KERN_ERR
+		       "ofn_sysfs_init: subsystem_register failed\n");
+		ret = -ENOMEM;
+		goto err;
+	}
+
+	ret = sysfs_create_file(android_ofn_kobj, &dev_attr_mode.attr);
+	if (ret) {
+		printk(KERN_ERR
+		       "touch_sysfs_init: sysfs_create_group failed\n");
+		goto error;
+	}
+	return 0;
+error:
+	kobject_del(android_ofn_kobj);
+err:
+	return ret;
+}
+
+
+static uint8_t avago_read_register_byte(struct spi_device *spi, u8 reg)
+{
+	int ret;
+	u8 val;
+	u8 code = reg;
+
+	ret = spi_write_then_read(spi, &code, 1, &val, 1);
+
+	if (ret < 0) {
+		printk(KERN_ERR "spi read error reg:0x%X return:%d", reg, ret);
+		return ret;
+	}
+	
+	return val;
+}
+
+
+static int avago_write_register_byte(struct spi_device *spi, u8 reg, u8 val)
+{
+	int ret_val;
+	unsigned char buf[2];
+
+	/* MSB must be '1' to indicate write */
+	buf[0] = reg | 0x80;
+	buf[1] = val;
+	ret_val = spi_write_then_read(spi, buf, 2, NULL, 0);
+
+	if(ret_val < 0)
+	{
+		printk(KERN_ERR "spi write error reg:0x%X return:%d", reg, ret_val);
+	}
+	return ret_val;
+}
+
+
+
+static int avago_init_ofn(struct avago_ofn_data *ts)
+{
+	int ret = 0;
+	
+	/* Perform soft reset by writing 0x5A to address 0x3A */
+	avago_write_register_byte(ts->spi, 0x3A, 0x5A);
+	
+	/* init as datasheet required 
+	Write 0xE4 to address 0x60.
+	Set Speed Switching, write 0x62 with 0x12, 0x63 with 0x0E, 0x64 with 0x08, 0x65 with 0x06, 0x66 with 0x40, 0x67 with 0x08, 
+		0x68 with 0x48, 0x69 with 0x0A, 0x6A with 0x50, 0x6B with 0x48.
+	Set Assert/De-assert, write 0x6D with 0xC4, 0x6E with 0x34, 0x6F with 0x3C, 0x70 with 0x18, 0x71 with 0x20.
+	Set Finger Presence Detection threshold, write 0x75 with 0x50.
+	IF XY Quantization is used, then write 0x73 with 0x99 and 0x74 with 0x02.
+	Write 0x10 to register 0x1C. This will activate Burst mode. If Burst mode not used then skip this step.
+	Read from registers 0x02, 0x03 and 0x04 (or read these same 3 bytes with Burst mode) one time
+	*/
+	//avago_write_register_byte(ts->spi, 0x60, 0xE4);
+	avago_write_register_byte(ts->spi, 0x60, 0xF4); 	/* enable quatitation */
+	
+	avago_write_register_byte(ts->spi, 0x62, 0x12);
+//	avago_write_register_byte(ts->spi, 0x63, 0x0E);
+	avago_write_register_byte(ts->spi, 0x63, 0x01);
+	avago_write_register_byte(ts->spi, 0x64, 0x08);
+	avago_write_register_byte(ts->spi, 0x65, 0x06);
+	avago_write_register_byte(ts->spi, 0x66, 0x40);
+	avago_write_register_byte(ts->spi, 0x67, 0x08);
+	avago_write_register_byte(ts->spi, 0x68, 0x48);
+	avago_write_register_byte(ts->spi, 0x69, 0x0A);
+	avago_write_register_byte(ts->spi, 0x6A, 0x50);
+	avago_write_register_byte(ts->spi, 0x6B, 0x48);
+	
+	avago_write_register_byte(ts->spi, 0x6D, 0xC4);
+	avago_write_register_byte(ts->spi, 0x6E, 0x34);
+	avago_write_register_byte(ts->spi, 0x6F, 0x3C);
+	avago_write_register_byte(ts->spi, 0x70, 0x18);
+	avago_write_register_byte(ts->spi, 0x71, 0x20);
+	
+	avago_write_register_byte(ts->spi, 0x75, 0x50);
+	
+	avago_write_register_byte(ts->spi, 0x73, 0x99);
+	avago_write_register_byte(ts->spi, 0x74, 0x02);
+	
+	avago_read_register_byte(ts->spi, 0x2);
+	avago_read_register_byte(ts->spi, 0x3);
+	avago_read_register_byte(ts->spi, 0x4);
+
+	ts->motion_count = 0;
+	ts->motion_x = 0;
+	ts->motion_y = 0;
+	ts->key_pressed = 0;
+
+	return ret;
+}
+
+
+static int init_fpd(struct avago_ofn_data *ts)
+{
+	struct avago_fpd_data *fpd;
+
+	fpd = &ts->fpd;
+
+	fpd->motion2 = 0;
+	fpd->finger_on_counter = 0;
+	fpd->finger_leave_counter = 0;
+	fpd->FPD_turned_off = 0;
+	fpd->shutter_values_captured = 0;
+	fpd->last_state = THIRTEEN_MA;
+	fpd->shutter_at_40ma = 0;
+	fpd->shutter_at_13ma = 0;
+	fpd->switch_led_counter = 0;
+
+	return 0;
+}
+
+static int switch_led_driving(struct avago_ofn_data *ts)
+{
+	struct avago_fpd_data *fpd;	
+	union16 shutter1;
+
+	fpd = &ts->fpd;
+/*	
+		// Once FPD is off, make sensor operate in 9.6mA. (~10mA)
+		if (fpd->FPD_turned_off == 1)
+		{	//force current during future navigation to be in 13mA
+			//spi_write_sensor(0x1a,0x00);
+			avago_write_register_byte(ts->spi, 0x1a, 0x00);
+
+			fpd->last_state = THIRTEEN_MA;
+			fpd->FPD_turned_off = 0;
+			return 0;
+
+		}
+*/		
+		//if ( (time_15 == 0) && (time_99 == 0) && (led_switching_start == 1) )
+		{	// time_15 is the main timer for this loop.
+			// time_99 is the timer for motion loop. This variable will gate this loop so that it 
+			// will not start provided enough time has passed after there is no motion.
+			//
+			// [led_switching_start] : variable to keep track whether LED driving current 
+			// switching is required. 
+			// - When finger is moving, don't switch
+			// - When finger is not moving, switching after time_99,
+			// - When FPD is off, don't switch
+
+			// read the shutter values
+			//shutter1.b[0] = spi_read_sensor(ADBM_A320_SHUTTERUPPER_ADDR);
+			//shutter1.b[1] = spi_read_sensor(ADBM_A320_SHUTTERLOWER_ADDR);
+			shutter1.b[1] = avago_read_register_byte(ts->spi, ADBM_A320_SHUTTERUPPER_ADDR);
+			shutter1.b[0] = avago_read_register_byte(ts->spi, ADBM_A320_SHUTTERLOWER_ADDR);
+			//printk(KERN_INFO "shutter = %x \n", shutter1.w);
+			
+            		// If the last state is 40mA, switch to 13mA driving current
+			if (fpd->last_state == FORTY_MA)
+			{
+				fpd->shutter_at_40ma = shutter1.w;
+				//spi_write_sensor(0x1a,0x00);
+				avago_write_register_byte(ts->spi, 0x1a, 0x00);
+				fpd->last_state = THIRTEEN_MA;
+			}
+
+			// If the last state is 13mA, switch to 40mA driving current
+			else if ( fpd->last_state == THIRTEEN_MA )
+			{
+				fpd->shutter_at_13ma = shutter1.w;
+                		//spi_write_sensor(0x1a,0x03);
+				avago_write_register_byte(ts->spi, 0x1a, 0x03);
+				fpd->last_state = FORTY_MA;
+			}
+
+			// compare shutter ratio. uses *10 to take away decimal point comparison.
+			// shutter_ratio = shutter_at_40ma *10 /shutter_at_13ma ;
+			fpd->shutter_values_captured++;
+
+			// fail safe check
+			if (fpd->shutter_values_captured > 5)
+			{ 
+				fpd->shutter_values_captured = 0;
+			}
+
+		}
+
+	return 0;
+}
+
+static void avago_ofn_work_func(struct work_struct *work)
+{
+//	int ret;
+	char x, y, tempx, tempy;
+	struct avago_ofn_data *ts = container_of(work, struct avago_ofn_data, work);
+	uint8_t status, shutter_ratio;
+	uint8_t pix_min, pix_max, squal;
+	union16 shutter1;
+	struct avago_fpd_data *fpd = &ts->fpd;
+	
+
+	/* release the key */
+	if(ts->key_pressed)
+	{
+		input_report_key(ts->input_dev, ts->key_pressed, 0);
+		ts->key_pressed = 0;
+					
+		input_sync(ts->input_dev);
+	}
+	
+#ifdef AVAGO_DOME
+	/* handle dome(single click/ long press) */
+	if(ts->dome_count == 0)
+	{
+		if(!gpio_get_value(ts->dome_gpio))
+		{
+			ts->dome_count ++;
+			printk(KERN_INFO "dome gpio down, count = %d\n", ts->dome_count);
+
+//Sam test
+			gpio_set_value(ts->led_up_gpio,1);
+			gpio_set_value(ts->led_down_gpio,1);
+			msleep(100);
+			gpio_set_value(ts->led_down_gpio,0);
+			gpio_set_value(ts->led_up_gpio,0);
+			/* start timer, now is 5ms, adjust it for debounce */
+			hrtimer_start(&ts->dome_timer, ktime_set(0, MS_TO_NS(5)), HRTIMER_MODE_REL);
+			goto end_of_work_func;
+		}
+	}
+	else
+	{
+		/* let timer handle dome function */
+		goto end_of_work_func;
+	}
+#endif // AVAGO_DOME
+
+	status = avago_read_register_byte(ts->spi, 2);
+	//printk(KERN_ERR "motion = %x \n", status);
+
+#ifdef AVAGO_FPD
+		// Once FPD is off, make sensor operate in 9.6mA. (~10mA)
+		if (fpd->FPD_turned_off == 1)
+		{	//force current during future navigation to be in 13mA
+			//spi_write_sensor(0x1a,0x00);
+			avago_write_register_byte(ts->spi, 0x1a, 0x00);
+
+			fpd->last_state = THIRTEEN_MA;
+			fpd->FPD_turned_off = 0;
+		}
+
+	fpd->motion2 = status;
+	// motion2 is a variable to keep previously known FPD state in IC.		
+	if((fpd->motion2 & 0x01) && (fpd->finger_on_counter < FINGER_ON_THRESHOLD) )
+	{
+
+		fpd->switch_led_counter++;
+		if(fpd->switch_led_counter == 2)
+		{
+			switch_led_driving(ts);
+			fpd->switch_led_counter = 0;
+		}
+
+		// method 1: change driving current
+		if(fpd->shutter_values_captured == 2)
+		{
+			// Once two shutter values are captured, ratio of the two
+			// can be compared to check for presence of a reflective surface
+			shutter_ratio = fpd->shutter_at_40ma *10/fpd->shutter_at_13ma ;
+			//printk(KERN_INFO "shutter_ratio = %d \n", shutter_ratio);
+
+			if ( (shutter_ratio > 7) && (shutter_ratio < 14) )
+			{	// if LED shutter value is between 0.9 and 1.2, 
+				fpd->motion2 = fpd->motion2 & 0xFE;
+				printk(KERN_INFO "shutter_ratio = %d \n", shutter_ratio);
+			/*
+			FPD_turned_off = 1;				// set FPD off flag
+			L5 = !(motion2 & 0x01);			// show FPD status on LED
+			finger_leave_counter2 = 0;
+			finger_on_counter = 0;
+			free_scroll = 0;	// Stop free scrolling mode if applicable
+			*/
+			}
+			fpd->shutter_values_captured = 0;		// reset counter so shutter values can be recaptured.
+		}
+
+		// method 2
+		squal   = avago_read_register_byte(ts->spi, ADBM_A320_SQUAL_ADDR);
+		pix_min = avago_read_register_byte(ts->spi, ADBM_A320_MINIMUMPIXEL_ADDR);
+		pix_max = avago_read_register_byte(ts->spi, ADBM_A320_MAXIMUMPIXEL_ADDR);
+		shutter1.b[1] = avago_read_register_byte(ts->spi, ADBM_A320_SHUTTERUPPER_ADDR);
+		shutter1.b[0] = avago_read_register_byte(ts->spi, ADBM_A320_SHUTTERLOWER_ADDR);
+		// shutter1.b[0] is lower byte of a 16 bit unsigned integer
+		// shutter1.b[0] is upper byte of a 16 bit unsigned integer
+		// shutter1.w is the combined 16 bit unsigned integer.
+		//printk(KERN_INFO "squal = %x %x %x %x \n", squal, pix_min, pix_max, shutter1.w);
+		
+		//fpd->motion2 = status;
+		//printk(KERN_ERR "motion = %x \n", status);
+
+		// A comparison is done here to check is squal value is low (means finger is off),
+		// If pix_max - pix_min is high, it tends to mean a strong external light source (point source) 
+		// is present.
+		// if shutter is low, it tends to mean an external light is shining directly into the sensor, 
+		// and light reflected from sensor's LED cannot produce so might light.
+		if ( (abs(pix_max - pix_min) > 230) || (squal < 15) || (shutter1.w < 25) )
+		{	
+			// finger_leave_counter is built in to reduce hysteresis effects
+			// while finger is navigation smoothly, FPD may sometimes gets deactivated,
+			// this reduces it. 
+			if (fpd->finger_leave_counter >= 4)
+			{	// finger_leave_counter is built in to reduce hysteresis effects
+				// while finger is navigation smoothly, FPD may sometimes gets deactivated,
+				// this reduces it. 
+				printk(KERN_INFO "finger_leave_counter = %d \n", fpd->finger_leave_counter);
+
+				fpd->motion2 = fpd->motion2 & 0xFE;
+				/*
+				FPD_turned_off = 1;
+				finger_leave_counter = 0;
+				finger_on_counter = 0; // reset finger on counter
+				free_scroll = 0;	// Stop free scrolling mode if applicable
+				*/
+			}
+			else
+			{
+				fpd->finger_leave_counter++;
+			}
+
+		}
+
+		fpd->finger_on_counter++;
+		//printk(KERN_INFO "fpd->finger_on_counter = %d \n", fpd->finger_on_counter);
+		if (fpd->finger_on_counter == FINGER_ON_THRESHOLD) // 125 x 8ms = 1000ms
+		{
+			printk(KERN_INFO "finger on....\n\n");
+			// ToDo
+			// Light the led here to indicate finger touch
+		}
+		if (fpd->finger_on_counter > 150)
+		{ fpd->finger_on_counter = 149;}
+	}
+
+		if((fpd->motion2 & 0x01) == 0)
+		{
+			if(fpd->finger_on_counter >= FINGER_ON_THRESHOLD)
+			{
+				printk(KERN_INFO "......finger off......\n\n");
+				// ToDo
+				// Turn off  the led here to indicate finger off
+			}
+			init_fpd(ts);
+			fpd->FPD_turned_off = 1;
+		}
+		
+#endif // AVAGO_FPD
+
+	if(status & 0x80)
+	{
+		x = avago_read_register_byte(ts->spi, 3);
+		y = avago_read_register_byte(ts->spi, 4);
+		printk(KERN_INFO "x = %x y = %x\n", x, y);
+
+#ifdef AVAGO_FPD
+		if((ts->fpd.motion2 & 0x01) == 0)
+		{		
+			ts->fpd.motion2 |= 1;
+		
+			printk(KERN_INFO "fpd start\n");
+		}
+#endif // AVAGO_FPD
+
+		if( x != 0 || y != 0)
+		{
+			ts->motion_x += x;
+			ts->motion_y += y;
+		}
+		
+		if(ts->motion_count == 0)
+			ts->motion_count = 1;
+	}
+
+	/* handle x/y motion */
+	if(ts->motion_count > 0)
+	{
+				ts->motion_count++;
+				if(ts->motion_count > AVAGO_MOTION_COUNT)
+				{
+					ts->motion_count = 0;
+
+					/* don't handle overflow here */
+					if(ts->motion_x & 0x80)
+						tempx = (0x100 - (ts->motion_x & 0xff)) & 0xff;
+					else
+						tempx = ts->motion_x;
+					if(ts->motion_y & 0x80)
+						tempy = (0x100 - (ts->motion_y & 0xff)) & 0xff;
+					else
+						tempy = ts->motion_y;
+
+					if(tempx > AVAGO_MOTION_SCALE)
+					{
+						if(ts->motion_x & 0x80)
+						{
+							input_report_key(ts->input_dev, KEY_LEFT, 1);
+							ts->key_pressed = KEY_LEFT;
+						}
+						else
+						{
+							input_report_key(ts->input_dev, KEY_RIGHT, 1);
+							ts->key_pressed = KEY_RIGHT;
+						}
+						
+						input_sync(ts->input_dev);
+					}
+					else if(tempy > AVAGO_MOTION_SCALE)
+					{
+						if(ts->motion_y & 0x80)
+						{
+							input_report_key(ts->input_dev, KEY_DOWN, 1);
+							ts->key_pressed = KEY_DOWN;
+						}
+						else
+						{
+							input_report_key(ts->input_dev, KEY_UP, 1);
+							ts->key_pressed = KEY_UP;
+						}
+						
+						input_sync(ts->input_dev);
+					}
+
+						// clear the motion
+						ts->motion_x = 0;
+						ts->motion_y = 0;
+					
+				}
+									
+						
+	}		
+
+end_of_work_func:
+	if (ts->use_irq)
+		enable_irq(ts->irq);
+
+}
+
+static enum hrtimer_restart avago_ts_timer_func(struct hrtimer *timer)
+{
+	struct avago_ofn_data *ts = container_of(timer, \
+					struct avago_ofn_data, timer);
+	queue_work(avago_ofn_wq, &ts->work);
+
+	/* 8ms timer */
+	hrtimer_start(&ts->timer, ktime_set(0, MS_TO_NS(8)), HRTIMER_MODE_REL);
+	return HRTIMER_NORESTART;
+}
+
+static enum hrtimer_restart avago_dome_timer_func(struct hrtimer *timer)
+{
+	char gpio_value;
+	struct avago_ofn_data *ts = container_of(timer, \
+					struct avago_ofn_data, dome_timer);
+
+	gpio_value = gpio_get_value(ts->dome_gpio);
+	printk(KERN_INFO "gpio = %d, count = %d\n", gpio_value, ts->dome_count);
+
+	if(gpio_value)
+	{
+		/* dome up, send report to upper layer */
+		if(ts->dome_count == 1)
+		{
+			/* the first timer is 5ms to detect debouncing */
+			printk(KERN_INFO "debounceing, gpio = %d\n", gpio_value);
+			ts->dome_count = 0;
+			return HRTIMER_NORESTART;
+		}
+		else if(ts->dome_count <= DOME_SINGLE_CLICK_COUNT) //6
+		{
+			/* single click */
+			if(test_mode)
+			{
+				input_report_key(ts->input_dev, KEY_HOME, 1);
+				ts->key_pressed = KEY_HOME;
+			}
+			else
+			{
+				input_report_key(ts->input_dev, KEY_A, 1);
+				ts->key_pressed = KEY_A;
+			}
+				
+			printk(KERN_ERR "single click, count = %d\n", ts->dome_count);
+									
+			input_sync(ts->input_dev);
+			ts->dome_count = 0;
+			return HRTIMER_NORESTART;
+		}
+		else if(ts->dome_count <= DOME_LONG_PRESS_COUNT) //21
+		{
+			/* long press */
+			if(test_mode)
+			{
+				input_report_key(ts->input_dev, KEY_MENU, 1);
+				ts->key_pressed = KEY_MENU;
+			}
+			else
+			{
+				input_report_key(ts->input_dev, KEY_B, 1);
+				ts->key_pressed = KEY_B;
+			}
+			
+			printk(KERN_ERR "long press, count = %d\n", ts->dome_count);
+									
+			input_sync(ts->input_dev);
+			ts->dome_count = 0;
+			return HRTIMER_NORESTART;
+		}
+		else
+		{
+			printk(KERN_ERR "more than 2s, count = %d\n", ts->dome_count);
+			ts->dome_count = 0;
+			return HRTIMER_NORESTART;
+		}
+	}
+	else
+	{
+		/* dome down, increase the counter */
+		if(ts->dome_count < 0x80)	/* set the max value to avoid overflow */
+			ts->dome_count++;
+	}
+		
+
+	/* 100ms timer */
+	hrtimer_start(&ts->dome_timer, ktime_set(0, MS_TO_NS(100)), HRTIMER_MODE_REL);
+	return HRTIMER_NORESTART;
+}
+
+static irqreturn_t avago_ts_irq_handler(int irq, void *dev_id)
+{
+	struct avago_ofn_data *ts = dev_id;
+
+	/* printk("avago_ts_irq_handler\n"); */
+	disable_irq(ts->irq);
+	queue_work(avago_ofn_wq, &ts->work);
+	return IRQ_HANDLED;
+}
+
+static int __devinit avago_ofn_probe(struct spi_device *spi)
+{
+	struct avago_ofn_data *ts;
+	int ret = 0, gpio, i;
+//	struct avago_ofn_platform_data *pdata;
+
+	printk(KERN_ERR "avago_ofn_probe: init SPI\n");
+	spi->bits_per_word = 8;
+	spi->mode = SPI_MODE_3;
+	if (spi_setup(spi) < 0) {
+		printk(KERN_ERR "avago_ofn_probe: init SPI failed.\n");
+		ret = -ENODEV;
+	}
+	printk("%s : spi setup done\n",__func__);
+	ts = kzalloc(sizeof(struct avago_ofn_data), GFP_KERNEL);
+	if (ts == NULL) {
+		ret = -ENOMEM;
+		goto err_alloc_data_failed;
+	}
+	INIT_WORK(&ts->work, avago_ofn_work_func);
+	ts->spi = spi;
+	ts->irq = spi->irq;
+	dev_set_drvdata(&spi->dev, ts);
+/*	pdata = spi->dev.platform_data;
+	if (pdata) {
+		ts->power = pdata->power;
+	}
+	if (ts->power) {
+		ret = ts->power(1);
+		msleep(10);
+		if (ret < 0) {
+			printk(KERN_ERR "avago_ofn_probe power on failed\n");
+			goto err_power_failed;
+		}
+	}
+*/
+#ifdef AVAGO_RESET
+	/* Set NRST low then high */
+	gpio = AVAGO_RESET_GPIO;
+	ret = gpio_request(gpio, "gpio_ofn_reset");
+	if (ret < 0) {
+		printk(KERN_ERR "gpio_ofn_reset: failed to request GPIO %d,"
+				" error %d\n", gpio, ret);
+			goto err_detect_failed;
+	}
+	//Sam 
+	//tegra_gpio_enable(gpio);	
+	printk("gpio_ofn_reset:request GPIO= %d,"
+                                " ret= %d\n", gpio, ret);	
+	ret = gpio_direction_output(gpio, 0);
+	if (ret < 0) {
+		gpio_free(gpio);
+		goto err_detect_failed;
+	}
+	msleep(100);
+	
+	ret = gpio_direction_output(gpio, 1);
+	msleep(100);
+	gpio_free(gpio);
+#endif // AVAGO_RESET
+
+	ts->shutdown_gpio = 0;
+#ifdef AVAGO_GPIO_CONTROL_SHUTDOWN
+	gpio = AVAGO_SHUTDOWN_GPIO;
+	ret = gpio_request(gpio, "gpio_ofn_shutdown");
+	if (ret < 0) {
+		ts->shutdown_gpio = 0;
+		printk(KERN_ERR "gpio_ofn_shutdown: failed to request GPIO %d,"
+				" error %d\n", gpio, ret);
+		goto err_detect_failed;
+	}
+	
+	//tegra_gpio_enable(gpio);
+
+	ret = gpio_direction_output(gpio, 0);
+	
+	printk("gpio_ofn_reset:request GPIO= %d,"" ret= %d\n", gpio, ret);
+	if (ret < 0) {
+		ts->shutdown_gpio = 0;
+		gpio_free(gpio);
+		goto err_detect_failed;
+	}
+	ts->shutdown_gpio = AVAGO_SHUTDOWN_GPIO;
+#endif // AVAGO_GPIO_CONTROL_SHUTDOWN
+
+	ts->dome_gpio = 0;
+	ts->dome_count = 0;
+#ifdef AVAGO_DOME
+	gpio = AVAGO_DOME_GPIO;
+	ret = gpio_request(gpio, "gpio_ofn_dome");
+	if (ret < 0) {
+		ts->dome_gpio = 0;
+		printk(KERN_ERR "gpio_ofn_dome: failed to request GPIO %d,"
+				" error %d\n", gpio, ret);
+		goto err_detect_failed;
+	}
+	
+	ret = gpio_direction_input(gpio);
+	if (ret < 0) {
+		ts->dome_gpio = 0;
+		gpio_free(gpio);
+		goto err_detect_failed;
+	}
+	ts->dome_gpio = AVAGO_DOME_GPIO;
+#endif // AVAGO_DOME
+//Sam add led control
+        ts->led_up_gpio = 0;
+        ts->led_down_gpio = 0;
+#ifdef AVAGO_LED_CONTROL
+        gpio = AVAGO_LED_UP;
+        ret = gpio_request(gpio, "gpio_led_up");
+        if (ret < 0) {
+                ts->dome_gpio = 0;
+                printk(KERN_ERR "gpio_ofn_dome: failed to request GPIO %d,"
+                                " error %d\n", gpio, ret);
+                goto err_detect_failed;
+        }
+        msleep(100);
+        ret = gpio_direction_output(gpio,0);
+	msleep(100);
+        if (ret < 0) {
+                ts->dome_gpio = 0;
+                gpio_free(gpio);
+                goto err_detect_failed;
+        }
+        ts->led_up_gpio = AVAGO_LED_UP;
+	
+        gpio = AVAGO_LED_DOWN;
+        ret = gpio_request(gpio, "gpio_led_down");
+        if (ret < 0) {
+                ts->dome_gpio = 0;
+                printk(KERN_ERR "gpio_ofn_dome: failed to request GPIO %d,"
+                                " error %d\n", gpio, ret);
+                goto err_detect_failed;
+        }
+        msleep(100);
+        ret = gpio_direction_output(gpio,0);
+        msleep(100);
+        if (ret < 0) {
+                ts->dome_gpio = 0;
+                gpio_free(gpio);
+                goto err_detect_failed;
+        }
+        ts->led_down_gpio = AVAGO_LED_DOWN;
+
+
+
+#endif // AVAGO_LED
+
+	printk("%s : GPIO config done\n",__func__);
+	printk("+%s : read 0x3A\n",__func__);
+	/* Perform soft reset by writing 0x5A to address 0x3A */
+	avago_write_register_byte(ts->spi, 0x3A, 0x5A);
+	printk("-%s : read 0x3A\n",__func__);
+	/* wait for stabilize */
+	msleep(100);
+	
+	ret = avago_read_register_byte(ts->spi, 0x0);
+	if (ret != AVAGO_OFN_ID) {
+		printk(KERN_ERR "avago TWI read failed\n");
+		goto err_detect_failed;
+	}
+	else
+		printk(KERN_INFO "avago_ofn_probe: Product Major Version %x\n", ret);
+	
+
+	ts->input_dev = input_allocate_device();
+	if (ts->input_dev == NULL) {
+		ret = -ENOMEM;
+		printk(KERN_ERR "avago_ofn_probe: Failed to allocate input device\n");
+		goto err_input_dev_alloc_failed;
+	}
+	
+	ts->input_dev->name = "avago-pt";
+	ts->input_dev->phys = "aofn/input0";
+	ts->input_dev->id.bustype = BUS_HOST;
+	ts->input_dev->id.vendor = 0x0001;
+	ts->input_dev->id.product = 0x0001;
+	ts->input_dev->id.version = 0x0100;
+
+	ts->input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_REP);
+	ts->input_dev->keycode = avago_keycode;
+	ts->input_dev->keycodesize = sizeof(unsigned char);
+	ts->input_dev->keycodemax = ARRAY_SIZE(avago_keycode);
+
+	for (i = 1; i < ARRAY_SIZE(avago_keycode); i++) {
+		set_bit(avago_keycode[i], ts->input_dev->keybit);
+	}
+
+
+	ret = input_register_device(ts->input_dev);
+	if (ret) {
+		printk(KERN_ERR "avago_ofn_probe: "
+				"Unable to register %s input device\n",
+			ts->input_dev->name);
+		goto err_input_register_device_failed;
+	}
+	
+	printk(KERN_ERR "avago_ofn_probe: client irq %d", spi->irq);
+	
+
+	if (spi->irq) {
+		ret = request_irq(spi->irq, avago_ts_irq_handler, IRQF_TRIGGER_RISING,
+			spi->dev.driver->name, ts);
+			//client->driver_name, ts);
+		if (ret == 0)
+			ts->use_irq = 1;
+		else
+			dev_err(&spi->dev, "request_irq failed\n");
+	}
+	if (!ts->use_irq) {
+		hrtimer_init(&ts->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+		ts->timer.function = avago_ts_timer_func;
+		hrtimer_start(&ts->timer, ktime_set(1, 0), HRTIMER_MODE_REL);
+	}
+	
+	if (ts->dome_gpio) {
+		hrtimer_init(&ts->dome_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+		ts->dome_timer.function = avago_dome_timer_func;
+		//hrtimer_start(&ts->timer, ktime_set(1, 0), HRTIMER_MODE_REL);
+	}
+
+	ts->fpd_support = 0;	
+#ifdef AVAGO_FPD	
+	ts->fpd_support = 1;
+#endif //AVAGO_FPD
+
+	if (ts->fpd_support) {
+		init_fpd(ts);
+
+	}
+
+#ifdef CONFIG_HAS_EARLYSUSPEND
+	ts->early_suspend.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN + 1;
+	ts->early_suspend.suspend = avago_ofn_early_suspend;
+	ts->early_suspend.resume = avago_ofn_late_resume;
+	register_early_suspend(&ts->early_suspend);
+#endif
+
+	printk(KERN_INFO "avago_ofn_probe: Start OFN %s in %s mode\n", ts->input_dev->name, ts->use_irq ? "interrupt" : "polling");
+
+	// initial the chip
+	ret = avago_init_ofn(ts);
+
+	test_mode = 0;	
+	// initial sysfs
+	ofn_sysfs_init();
+	
+	return 0;
+
+err_input_register_device_failed:
+	input_free_device(ts->input_dev);
+
+err_input_dev_alloc_failed:
+err_detect_failed:
+//err_power_failed:
+	kfree(ts);
+err_alloc_data_failed:
+//err_check_functionality_failed:
+	return ret;
+}
+
+static int avago_ofn_remove(struct spi_device *spi)
+{
+	struct avago_ofn_data *ts = dev_get_drvdata(&spi->dev);
+	//unregister_early_suspend(&ts->early_suspend);
+	
+	if(ts->shutdown_gpio)
+		gpio_free(ts->shutdown_gpio);
+	if(ts->dome_gpio)
+		gpio_free(ts->dome_gpio);
+
+
+	if (ts->use_irq)
+		free_irq(spi->irq, ts);
+	else
+		hrtimer_cancel(&ts->timer);
+
+	if(ts->dome_gpio)
+		hrtimer_cancel(&ts->dome_timer);
+	
+	input_unregister_device(ts->input_dev);
+	kfree(ts);
+	return 0;
+}
+
+
+static int avago_ofn_suspend(struct spi_device *spi, pm_message_t mesg)
+{
+	int ret;
+	struct avago_ofn_data *ts = dev_get_drvdata(&spi->dev);
+
+	if (ts->use_irq)
+		disable_irq(ts->irq);
+	else
+		hrtimer_cancel(&ts->timer);
+	ret = cancel_work_sync(&ts->work);
+	
+	/* Forces lowest power mode, same as asserting shutdown pin */
+	if(ts->shutdown_gpio)
+		gpio_direction_output(ts->shutdown_gpio, 1);
+	
+	if(ts->dome_gpio)
+		hrtimer_cancel(&ts->dome_timer);
+
+	if (ts->power) {
+		ret = ts->power(0);
+		if (ret < 0) {
+			printk(KERN_ERR "%s: power off failed\n", __func__);
+		}
+	}
+	return 0;
+}
+
+static int avago_ofn_resume(struct spi_device *spi)
+{
+	int ret;
+	struct avago_ofn_data *ts = dev_get_drvdata(&spi->dev);
+
+	if (ts->power) {
+		ret = ts->power(1);
+		if (ret < 0) {
+			printk(KERN_ERR "%s: power on failed\n", __func__);
+		}
+	}
+	/* reset, same effect as de-asserting shutdown pin. */
+	if(ts->shutdown_gpio)
+	{
+		gpio_direction_output(ts->shutdown_gpio, 0);
+		// initial the chip
+		avago_init_ofn(ts);
+
+		msleep(200);
+	}
+
+	if (ts->use_irq)
+		enable_irq(spi->irq);
+
+	if (!ts->use_irq) {
+		hrtimer_init(&ts->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+		ts->timer.function = avago_ts_timer_func;
+		hrtimer_start(&ts->timer, ktime_set(1, 0), HRTIMER_MODE_REL);
+	}
+	
+	if (ts->dome_gpio) {
+		hrtimer_init(&ts->dome_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+		ts->dome_timer.function = avago_dome_timer_func;
+		
+		ts->dome_count = 0;
+	}
+	
+	if (ts->fpd_support) {
+		
+		init_fpd(ts);
+	}
+
+	return 0;
+}
+
+#ifdef CONFIG_HAS_EARLYSUSPEND
+static void avago_ofn_early_suspend(struct early_suspend *h)
+{
+	struct avago_ofn_data *ts;
+	ts = container_of(h, struct avago_ofn_data, early_suspend);
+	avago_ofn_suspend(ts->spi, PMSG_SUSPEND);
+}
+
+static void avago_ofn_late_resume(struct early_suspend *h)
+{
+	struct avago_ofn_data *ts;
+	ts = container_of(h, struct avago_ofn_data, early_suspend);
+	avago_ofn_resume(ts->spi);
+}
+#endif
+
+static struct spi_driver avago_ofn_driver = {
+   .driver    = {
+      .name   = "avago-ofn",
+      .bus    = &spi_bus_type,
+      .owner  = THIS_MODULE,
+   },
+   .probe   = avago_ofn_probe,
+   .remove  = avago_ofn_remove,
+#ifndef CONFIG_HAS_EARLYSUSPEND
+   .suspend = avago_ofn_suspend,
+   .resume	 = avago_ofn_resume,
+#endif   
+};
+
+
+static int __init avago_ofn_init(void)
+{
+	avago_ofn_wq = create_singlethread_workqueue("avago_ofn_wq");
+	if (!avago_ofn_wq)
+		return -ENOMEM;
+	return spi_register_driver(&avago_ofn_driver);
+}
+
+static void __exit avago_ofn_exit(void)
+{
+	if (avago_ofn_wq)
+		destroy_workqueue(avago_ofn_wq);
+	spi_unregister_driver(&avago_ofn_driver);
+}
+
+module_init(avago_ofn_init);
+module_exit(avago_ofn_exit);
+
+MODULE_AUTHOR("Marcus J. <marcus.jie@avagotech.com>");
+MODULE_DESCRIPTION("AVAGO OFN SPI DRIVER");
+MODULE_LICENSE("GPL");

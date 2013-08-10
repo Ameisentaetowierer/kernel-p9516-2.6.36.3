@@ -1,0 +1,9 @@
+#obj-y				+= diag.o
+#obj-y				+= debug.o
+#obj-y				+= headphone_switch.o
+obj-y				+= rotationlock_switch.o
+#obj-y				+= simdet_switch.o
+#obj-y				+= vibrator.o
+#obj-y				+= psensor.o
+obj-y				+= dock_switch.o
+obj-y				+= lcd.o
